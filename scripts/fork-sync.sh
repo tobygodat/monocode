@@ -10,24 +10,22 @@ set -euo pipefail
 #   git fetch upstream && git merge upstream/main && git push
 
 FORK="${MONOCODE_FORK:-tobygodat/monocode}"
-UPSTREAM="${MONOCODE_UPSTREAM:-hardbeat920/monocode}"
 
 notify() {
   command -v notify-send >/dev/null 2>&1 && notify-send -a "MonoCode fork sync" "$@" || true
 }
 
-before="$(gh api "repos/$FORK/commits/main" --jq .sha)"
-if ! out="$(gh repo sync "$FORK" --source "$UPSTREAM" --branch main 2>&1)"; then
-  echo "$out" >&2
-  notify -u critical "Upstream sync failed" "$out"
+# merge-upstream fast-forwards, or creates a merge commit when the fork has its
+# own commits; it never overwrites them. Conflicts fail with HTTP 409.
+if ! merge_type="$(gh api -X POST "repos/$FORK/merge-upstream" -f branch=main --jq .merge_type 2>&1)"; then
+  echo "$merge_type" >&2
+  notify -u critical "Upstream sync failed" "$merge_type"
   exit 1
 fi
-echo "$out"
-after="$(gh api "repos/$FORK/commits/main" --jq .sha)"
 
-if [[ "$before" == "$after" ]]; then
-  echo "Already up to date with $UPSTREAM."
+if [[ "$merge_type" == "none" ]]; then
+  echo "Already up to date with upstream."
 else
-  echo "Synced $FORK main ${before:0:7} -> ${after:0:7}; fork release build triggered."
-  notify "Synced with upstream" "main ${before:0:7} → ${after:0:7}. A new build will be offered in Settings → General."
+  echo "Synced $FORK main with upstream ($merge_type); fork release build triggered."
+  notify "Synced with upstream" "main updated ($merge_type). A new build will be offered in Settings → General."
 fi
