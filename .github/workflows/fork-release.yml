@@ -1,0 +1,115 @@
+# Fork-only release: every push to main publishes a signed Linux AppImage
+# and the updater feed (latest.json) to this fork's GitHub Releases.
+#
+# Version: <package.json version>-fork.<run number>. The run number only
+# grows and the upstream base version never goes backwards, so each release
+# compares newer than the last. The version is injected at build time, so
+# no version commit ever conflicts with upstream's version bumps.
+name: Fork release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  UPDATER_PUBKEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ5MDFBQzYzNkFCMzFCRDcKUldUWEc3TnFZNndCU1RwWmVaSXh0c3BNTDUrK1BOMkc0ejlqNTZmd2l2R3pxTGlvSW5FcFhoQnUK
+
+jobs:
+  appimage:
+    if: github.repository != 'hardbeat920/monocode'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux system dependencies
+        run: bash scripts/install-linux-deps-debian.sh
+
+      - run: npm ci
+
+      - name: Write release config
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const base = require("./package.json").version.split(/[-+]/)[0];
+          const version = `${base}-fork.${process.env.GITHUB_RUN_NUMBER}`;
+          const endpoint = `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/latest/download/latest.json`;
+          fs.writeFileSync(
+            `${process.env.RUNNER_TEMP}/tauri.fork.conf.json`,
+            JSON.stringify({ version, plugins: { updater: { pubkey: process.env.UPDATER_PUBKEY, endpoints: [endpoint] } } }, null, 2),
+          );
+          fs.appendFileSync(process.env.GITHUB_ENV, `VERSION=${version}\n`);
+          console.log(`Fork release ${version} -> ${endpoint}`);
+          NODE
+
+      - name: Build AppImage
+        run: |
+          set -euo pipefail
+          npx tauri build --bundles appimage --config "$RUNNER_TEMP/tauri.fork.conf.json"
+          bash scripts/repack-appimage.sh
+
+      - name: Assert AppImage uses host libraries
+        run: bash scripts/assert-appimage-host-libs.sh
+
+      # Sign after repack-appimage.sh rewrites the file.
+      - name: Sign AppImage for the updater
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          appimage=(target/release/bundle/appimage/*.AppImage)
+          if (( ${#appimage[@]} != 1 )); then
+            echo "Expected exactly one AppImage" >&2
+            exit 1
+          fi
+          npx tauri signer sign "${appimage[0]}"
+          test -s "${appimage[0]}.sig"
+          echo "APPIMAGE=${appimage[0]}" >> "$GITHUB_ENV"
+
+      - name: Write updater feed
+        run: |
+          set -euo pipefail
+          name="$(basename "$APPIMAGE")"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/${name}" \
+          SIG="$APPIMAGE.sig" node <<'NODE'
+          const fs = require("node:fs");
+          const feed = {
+            version: process.env.VERSION,
+            notes: `MonoCode ${process.env.VERSION} (${process.env.GITHUB_SHA.slice(0, 7)})`,
+            pub_date: new Date().toISOString(),
+            platforms: {
+              // AppImage only, matching upstream's feed.
+              "linux-x86_64-appimage": {
+                signature: fs.readFileSync(process.env.SIG, "utf8").trim(),
+                url: process.env.URL,
+              },
+            },
+          };
+          fs.writeFileSync("latest.json", JSON.stringify(feed, null, 2) + "\n");
+          NODE
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" "$APPIMAGE" "$APPIMAGE.sig" latest.json \
+            --target "$GITHUB_SHA" --title "MonoCode $VERSION" \
+            --notes "Fork build of ${GITHUB_SHA}." --latest
